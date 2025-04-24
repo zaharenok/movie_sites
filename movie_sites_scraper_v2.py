@@ -15,8 +15,12 @@ class MovieSitesScraper:
     def __init__(self):
         self.sites = set()
         self.max_results = 1500
-        self.initial_delay = 10  # Уменьшаем начальную задержку
-        self.timeout = 120000  # Оставляем таймаут для стабильности
+        self.initial_delay = 10
+        self.timeout = 120000
+        self.max_tabs = 5  # Максимальное количество одновременно открытых вкладок
+        self.tab_timeout = 300  # Таймаут для неактивных вкладок (в секундах)
+        self.visited_pages = set()  # Кэш посещенных страниц
+        self.active_tabs = {}  # Словарь активных вкладок {page_id: timestamp}
         
         # Список доменов для исключения
         self.excluded_domains = [
@@ -315,8 +319,52 @@ class MovieSitesScraper:
         df.to_csv('movie_sites.csv', index=False)
         print(f"Результаты сохранены. Всего сайтов: {len(results)}")
 
+    async def cleanup_inactive_tabs(self, context):
+        """Очищает неактивные вкладки"""
+        current_time = time.time()
+        for page_id, timestamp in list(self.active_tabs.items()):
+            if current_time - timestamp > self.tab_timeout:
+                try:
+                    page = context.pages[page_id]
+                    await page.close()
+                    del self.active_tabs[page_id]
+                    print(f"Закрыта неактивная вкладка {page_id}")
+                except Exception as e:
+                    print(f"Ошибка при закрытии вкладки {page_id}: {e}")
+
+    async def get_new_page(self, context):
+        """Получает новую вкладку с учетом ограничений"""
+        # Очищаем неактивные вкладки
+        await self.cleanup_inactive_tabs(context)
+        
+        # Если достигнут лимит вкладок, закрываем самую старую
+        if len(self.active_tabs) >= self.max_tabs:
+            oldest_page_id = min(self.active_tabs.items(), key=lambda x: x[1])[0]
+            try:
+                page = context.pages[oldest_page_id]
+                await page.close()
+                del self.active_tabs[oldest_page_id]
+                print(f"Закрыта старая вкладка {oldest_page_id}")
+            except Exception as e:
+                print(f"Ошибка при закрытии старой вкладки: {e}")
+        
+        # Создаем новую вкладку
+        page = await context.new_page()
+        self.active_tabs[page.page_id] = time.time()
+        return page
+
     async def scrape_google(self, page, query, region):
         try:
+            # Проверяем, не посещали ли мы уже эту страницу
+            page_key = f"{query}_{region}"
+            if page_key in self.visited_pages:
+                print(f"Пропускаем уже проверенную страницу: {query}")
+                return False
+            self.visited_pages.add(page_key)
+            
+            # Обновляем время последней активности вкладки
+            self.active_tabs[page.page_id] = time.time()
+            
             # Устанавливаем геолокацию для текущего региона
             await page.context.set_geolocation(self.geolocations[region])
             
@@ -350,6 +398,9 @@ class MovieSitesScraper:
                 for _ in range(5):
                     await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
                     await asyncio.sleep(1)
+                
+                # Очищаем память после прокрутки
+                await page.evaluate('window.gc()')
                 
                 content = await page.content()
                 soup = BeautifulSoup(content, 'html.parser')
@@ -401,13 +452,12 @@ class MovieSitesScraper:
                     elif 'yahoo' in search_engine:
                         next_button = await page.query_selector('text=Next')
                     else:
-                        # Для других поисковиков ищем любую кнопку "Next" или "Следующая"
                         next_button = await page.query_selector('text=Next, text=Следующая, text=Next page')
                     
                     if next_button:
                         await next_button.click()
                         await page.wait_for_load_state('networkidle', timeout=self.timeout)
-                        await asyncio.sleep(1)  # Уменьшаем паузу между страницами
+                        await asyncio.sleep(1)
                     else:
                         break
                 except Exception as e:
@@ -437,28 +487,39 @@ class MovieSitesScraper:
                 timezone_id='Asia/Kolkata'
             )
             
-            page = await context.new_page()
-            
-            # Перемешиваем запросы
-            random.shuffle(self.search_queries)
-            
-            # Используем только Индию как регион
-            region = 'india'
-            
             try:
+                # Перемешиваем запросы
+                random.shuffle(self.search_queries)
+                
+                # Используем только Индию как регион
+                region = 'india'
+                
                 for query in self.search_queries:
                     if len(self.sites) >= self.max_results:
                         break
                     
                     print(f"\nПоиск по запросу: {query}")
+                    
+                    # Получаем новую вкладку
+                    page = await self.get_new_page(context)
+                    
                     if await self.scrape_google(page, query, region):
                         break
                     
                     # Минимальная пауза между запросами
                     await asyncio.sleep(1)
+                    
+                    # Очищаем неактивные вкладки после каждого запроса
+                    await self.cleanup_inactive_tabs(context)
             except KeyboardInterrupt:
                 print("\nПолучен сигнал прерывания. Сохраняем текущие результаты...")
             finally:
+                # Закрываем все вкладки
+                for page in context.pages:
+                    try:
+                        await page.close()
+                    except:
+                        pass
                 await browser.close()
                 await self.save_results()
                 
